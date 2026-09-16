@@ -95,23 +95,39 @@ def get_content_recommendations(title: str,
 
 
 def build_collab_model(user_item_matrix: pd.DataFrame, n_components: int = 20):
-    """Truncated SVD collaborative filtering on the user-item matrix.
+    """Truncated SVD collaborative filtering with user mean-centering.
 
     The ml-latest-small matrix (610 users x 9,742 movies) is highly sparse
-    (density ~1.7%). SVD with 20 latent components captures the dominant
-    user-preference signals without overfitting.
+    (density ~1.7%). Zeros represent unrated items, NOT zero-star ratings.
+    Mean-centering subtracts each user's average rating from their rated cells
+    only before SVD decomposition, then adds the mean back to predictions.
+    This prevents unrated zeros from biasing the latent factor learning.
 
     Returns (svd, pred_df) where pred_df contains predicted ratings for every
     user-movie pair, including those the user has not yet rated.
     """
+    matrix = user_item_matrix.astype(np.float64).copy()
+
+    rated_mask = matrix > 0
+    user_means = matrix.where(rated_mask).mean(axis=1)
+    matrix_centered = matrix.copy()
+    for uid in matrix.index:
+        mask = rated_mask.loc[uid]
+        matrix_centered.loc[uid, mask] = matrix.loc[uid, mask] - user_means[uid]
+
     svd = TruncatedSVD(n_components=n_components, random_state=42)
-    latent_matrix = svd.fit_transform(user_item_matrix)
-    predicted_ratings = np.dot(latent_matrix, svd.components_)
+    latent_matrix = svd.fit_transform(matrix_centered)
+    predicted_centered = np.dot(latent_matrix, svd.components_)
+
     pred_df = pd.DataFrame(
-        predicted_ratings,
+        predicted_centered,
         index=user_item_matrix.index,
         columns=user_item_matrix.columns,
     )
+    for uid in pred_df.index:
+        pred_df.loc[uid] = pred_df.loc[uid] + user_means[uid]
+
+    pred_df = pred_df.clip(lower=0.5, upper=5.0)
     return svd, pred_df
 
 
@@ -149,10 +165,9 @@ def compute_rmse(ratings: pd.DataFrame,
                  test_size: float = 0.2) -> float:
     """RMSE evaluation on a 20% hold-out split of observed ratings.
 
-    Only users and movies present in the training split are evaluated.
-    The matrix is normalised to [0, 1] before SVD to prevent numerical
-    overflow on the small sub-matrix, then rescaled back for RMSE
-    computation on the original 0.5-5.0 rating scale.
+    Uses user mean-centering before SVD so that unrated zeros do not bias
+    the latent factor decomposition. Predictions are clipped to [0.5, 5.0]
+    and evaluated against held-out ratings on the original half-star scale.
     """
     known = ratings[["userId", "movieId", "rating"]].copy()
     train_data, test_data = train_test_split(known, test_size=test_size, random_state=42)
@@ -161,17 +176,22 @@ def compute_rmse(ratings: pd.DataFrame,
         index="userId", columns="movieId", values="rating"
     ).fillna(0).astype(np.float64)
 
-    max_val = train_matrix.values.max()
-    if max_val > 0:
-        train_matrix = train_matrix / max_val
+    rated_mask  = train_matrix > 0
+    user_means  = train_matrix.where(rated_mask).mean(axis=1)
+    mat_centered = train_matrix.copy()
+    for uid in train_matrix.index:
+        mask = rated_mask.loc[uid]
+        mat_centered.loc[uid, mask] = train_matrix.loc[uid, mask] - user_means[uid]
 
-    svd = TruncatedSVD(n_components=min(n_components, min(train_matrix.shape) - 1),
-                       random_state=42)
-    latent = svd.fit_transform(train_matrix)
-    pred = np.dot(latent, svd.components_)
-    if max_val > 0:
-        pred = pred * max_val
-    pred_df = pd.DataFrame(pred, index=train_matrix.index, columns=train_matrix.columns)
+    n_comp = min(n_components, min(train_matrix.shape) - 1)
+    svd = TruncatedSVD(n_components=n_comp, random_state=42)
+    latent = svd.fit_transform(mat_centered)
+    pred_centered = np.dot(latent, svd.components_)
+
+    pred_df = pd.DataFrame(pred_centered, index=train_matrix.index, columns=train_matrix.columns)
+    for uid in pred_df.index:
+        pred_df.loc[uid] = pred_df.loc[uid] + user_means[uid]
+    pred_df = pred_df.clip(lower=0.5, upper=5.0)
 
     test_data = test_data[
         test_data["userId"].isin(pred_df.index) &
@@ -181,17 +201,14 @@ def compute_rmse(ratings: pd.DataFrame,
     if test_data.empty:
         return float("nan")
 
-    y_true = test_data["rating"].values
-
-    user_pos = pred_df.index.get_indexer(test_data["userId"].values)
+    y_true    = test_data["rating"].values
+    user_pos  = pred_df.index.get_indexer(test_data["userId"].values)
     movie_pos = pred_df.columns.get_indexer(test_data["movieId"].values)
-
-    valid_mask = (user_pos >= 0) & (movie_pos >= 0)
-    y_pred = pred_df.values[user_pos[valid_mask], movie_pos[valid_mask]]
-    y_true = y_true[valid_mask]
+    valid     = (user_pos >= 0) & (movie_pos >= 0)
+    y_pred    = pred_df.values[user_pos[valid], movie_pos[valid]]
+    y_true    = y_true[valid]
 
     if len(y_true) == 0:
         return float("nan")
 
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    return round(rmse, 4)
+    return round(float(np.sqrt(mean_squared_error(y_true, y_pred))), 4)
